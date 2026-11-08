@@ -19,7 +19,6 @@ package org.apache.catalina.webresources;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -179,31 +178,52 @@ public class TestDirResourceSetLocking {
 
 
     /*
-     * CVE-2024-50379 is only exploitable on a case insensitive file system, so
-     * on such a file system paths that differ only in case must share a lock.
-     * On a case sensitive file system they refer to different files and must
-     * not contend.
-     *
-     * This asserts against the case sensitivity DirResourceSet actually
-     * determined for itself in initInternal(), so it holds on any host file
-     * system. The two branches are additionally covered deterministically by
-     * testLockKeyIsCaseFolded...() / testLockKeyIsNotCaseFolded...() below.
+     * A directory may be named with or without a trailing '/' and getResource() locks the path as requested before
+     * it adds the '/' for a directory. The trailing '/' is therefore stripped from the lock key so that both
+     * spellings share one lock, else a read of one and a write of the other would not contend.
      */
     @Test
-    public void testLockKeyCaseSensitivityFollowsFileSystem() throws Exception {
+    public void testLockKeyIgnoresTrailingSlash() throws Exception {
+        ResourceLock lock1 = dirResourceSet.lockForRead("/dir");
+        ResourceLock lock2 = dirResourceSet.lockForRead("/dir/");
+        try {
+            Assert.assertEquals("/dir", lock1.key);
+            Assert.assertSame("A path with and without a trailing '/' must share a ResourceLock", lock1, lock2);
+        } finally {
+            dirResourceSet.unlockForRead(lock2);
+            dirResourceSet.unlockForRead(lock1);
+        }
+
+        ResourceLock held = dirResourceSet.lockForRead("/dir");
+        CountDownLatch acquired = new CountDownLatch(1);
+        Thread t = startLockThread(acquired, false, "/dir/");
+        try {
+            Assert.assertFalse("A write of /dir/ must not proceed while /dir is being read",
+                    acquired.await(BLOCKED_MS, TimeUnit.MILLISECONDS));
+        } finally {
+            dirResourceSet.unlockForRead(held);
+        }
+        Assert.assertTrue(acquired.await(GRANTED_MS, TimeUnit.MILLISECONDS));
+        t.join(GRANTED_MS);
+    }
+
+
+    /*
+     * CVE-2024-50379 is only exploitable on a case insensitive file system, so
+     * on such a file system paths that differ only in case must share a lock.
+     * Whether a DirResourceSet is case sensitive cannot be determined reliably
+     * (see DirResourceSet.getLockKey()), so the lock key is always case folded
+     * and paths that differ only in case share a lock on any file system.
+     */
+    @Test
+    public void testLockKeyIsCaseFoldedOnAnyFileSystem() throws Exception {
         File lower = new File(tempDir, "case-test.jsp");
         Assert.assertTrue(lower.createNewFile());
 
         ResourceLock lock1 = dirResourceSet.lockForRead("/case-test.jsp");
         ResourceLock lock2 = dirResourceSet.lockForRead("/CASE-TEST.JSP");
         try {
-            if (isCaseSensitive(dirResourceSet)) {
-                Assert.assertNotSame("On a case sensitive file system paths differing only in case refer to " +
-                        "different files so they must not share a ResourceLock", lock1, lock2);
-            } else {
-                Assert.assertSame("On a case insensitive file system paths differing only in case refer to " +
-                        "the same file so they must share a ResourceLock", lock1, lock2);
-            }
+            Assert.assertSame("Paths differing only in case must share a ResourceLock", lock1, lock2);
         } finally {
             dirResourceSet.unlockForRead(lock2);
             dirResourceSet.unlockForRead(lock1);
@@ -212,16 +232,12 @@ public class TestDirResourceSetLocking {
 
 
     /*
-     * The case insensitive branch of the lock key calculation is the one that
-     * matters for CVE-2024-50379 but it cannot be reached on a case sensitive
-     * host file system, so drive it directly. Building the key is pure string
-     * manipulation and does not touch the file system, so forcing the flag is
-     * safe and deterministic on any host.
+     * The case folding of the lock key is the part that matters for
+     * CVE-2024-50379. Building the key is pure string manipulation and does not
+     * touch the file system, so this is deterministic on any host.
      */
     @Test
     public void testLockKeyIsCaseFoldedWhenFileSystemIsCaseInsensitive() throws Exception {
-        setCaseSensitive(dirResourceSet, false);
-
         // The key is normalized *and* lower cased.
         ResourceLock lock1 = dirResourceSet.lockForRead("/sub/../MiXeD.JSP");
         ResourceLock lock2 = dirResourceSet.lockForRead("/mixed.jsp");
@@ -249,24 +265,6 @@ public class TestDirResourceSetLocking {
         }
         Assert.assertTrue(acquired.await(GRANTED_MS, TimeUnit.MILLISECONDS));
         t.join(GRANTED_MS);
-    }
-
-
-    /* The complementary branch: no case folding on a case sensitive file system. */
-    @Test
-    public void testLockKeyIsNotCaseFoldedWhenFileSystemIsCaseSensitive() throws Exception {
-        setCaseSensitive(dirResourceSet, true);
-
-        ResourceLock lock1 = dirResourceSet.lockForRead("/sub/../MiXeD.JSP");
-        ResourceLock lock2 = dirResourceSet.lockForRead("/mixed.jsp");
-        try {
-            Assert.assertEquals("/MiXeD.JSP", lock1.key);
-            Assert.assertNotSame("Paths differing only in case refer to different files when the file system " +
-                    "is case sensitive so they must not share a ResourceLock", lock1, lock2);
-        } finally {
-            dirResourceSet.unlockForRead(lock2);
-            dirResourceSet.unlockForRead(lock1);
-        }
     }
 
 
@@ -486,6 +484,41 @@ public class TestDirResourceSetLocking {
 
 
     /*
+     * getResource() for a directory requested without a trailing '/' returns a FileResource whose path ends in '/'.
+     * Its delete() must contend with a read of the same directory in either spelling.
+     */
+    @Test
+    public void testDirectoryFileResourceUsesSameLockWithOrWithoutTrailingSlash() throws Exception {
+        File dir = new File(tempDir, "lock-dir");
+        Assert.assertTrue(dir.mkdir());
+
+        WebResource resource = dirResourceSet.getResource("/lock-dir");
+        Assert.assertTrue(resource.isDirectory());
+        Assert.assertEquals("/lock-dir/", resource.getWebappPath());
+
+        ResourceLock readLock = dirResourceSet.lockForRead("/lock-dir/");
+        final CountDownLatch deleted = new CountDownLatch(1);
+        Thread deleter = new Thread(() -> {
+            resource.delete();
+            deleted.countDown();
+        });
+        deleter.setDaemon(true);
+        try {
+            deleter.start();
+            Assert.assertFalse("delete() of the FileResource obtained for /lock-dir must contend with a read of " +
+                    "/lock-dir/",
+                    deleted.await(BLOCKED_MS, TimeUnit.MILLISECONDS));
+            Assert.assertTrue("The directory must still be present while the read lock is held", dir.exists());
+        } finally {
+            dirResourceSet.unlockForRead(readLock);
+        }
+        Assert.assertTrue(deleted.await(GRANTED_MS, TimeUnit.MILLISECONDS));
+        deleter.join(GRANTED_MS);
+        Assert.assertFalse(dir.exists());
+    }
+
+
+    /*
      * The original 5 argument constructor is retained for compatibility. It
      * creates a FileResource with no associated lock set so delete() must
      * still work.
@@ -511,25 +544,6 @@ public class TestDirResourceSetLocking {
         FileResource resource = new FileResource(root, "/read-only.txt", file, true, null);
         Assert.assertFalse(resource.delete());
         Assert.assertTrue(file.exists());
-    }
-
-
-    /*
-     * The case sensitivity DirResourceSet determined for itself in
-     * initInternal(). Read via reflection so that the tests assert against the
-     * value actually in use rather than re-implementing the detection.
-     */
-    private static boolean isCaseSensitive(DirResourceSet resourceSet) throws Exception {
-        Field field = DirResourceSet.class.getDeclaredField("caseSensitive");
-        field.setAccessible(true);
-        return ((Boolean) field.get(resourceSet)).booleanValue();
-    }
-
-
-    private static void setCaseSensitive(DirResourceSet resourceSet, boolean caseSensitive) throws Exception {
-        Field field = DirResourceSet.class.getDeclaredField("caseSensitive");
-        field.setAccessible(true);
-        field.set(resourceSet, Boolean.valueOf(caseSensitive));
     }
 
 
